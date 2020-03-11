@@ -16,11 +16,11 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/o3labs/neo-transaction-watcher/neotx"
-	"github.com/o3labs/neo-transaction-watcher/neotx/network"
+	"github.com/corollari/neo-ws-pub-sub/neo-transaction-watcher/neotx"
+	"github.com/corollari/neo-ws-pub-sub/neo-transaction-watcher/neotx/network"
 
-	"github.com/o3labs/neo-utils/neoutils"
-	"github.com/o3labs/neo-utils/neoutils/neorpc"
+	"github.com/corollari/neo-ws-pub-sub/neoutils"
+	"github.com/corollari/neo-ws-pub-sub/neorpc"
 )
 
 const (
@@ -52,10 +52,15 @@ type WebSocketMessage struct {
 	Data interface{} `json:"data,omitempty"`
 }
 
+type EventData struct {
+	Contract string   `json:"contract"`
+	Call interface{}  `json:"call,omitempty"`
+}
+
 type Configuration struct {
-	WebsocketPort uint     `json:"websocketPort"`
 	SeedList      []string `json:"seedList"`
 	RPCSeedList   []string `json:"rpcSeedList"`
+	WebsocketEventsProvider   string `json:"websocketEventsProvider"`
 	Magic         int      `json:"magic"` //network ID.
 }
 
@@ -75,16 +80,16 @@ var currentConfig Configuration
 
 //Base on the article 10M Concurrent websocket on https://goroutines.com/10m
 func main() {
-	mode := flag.String("network", "", "Network to connect to. main | test | private")
+	mode := flag.String("network", "", "Network to connect to. main | test")
+	portInt := flag.Int("port", 8080, "Port to bind to")
 	flag.Parse()
 
 	if *mode == "" {
-		//default mode is private
-		defaultEnv := "private"
+		defaultEnv := "main"
 		mode = &defaultEnv
 	}
 
-	file := "config.privatenet.json"
+	var file string
 	if *mode == "main" {
 		file = "config.json"
 	} else if *mode == "test" {
@@ -123,9 +128,10 @@ func main() {
 	})
 
 	go startConnectToSeed(config)
+	go relayEvents(config.WebsocketEventsProvider)
 
-	port := fmt.Sprintf(":%d", config.WebsocketPort)
-	fmt.Printf("Websocket running at port %v\n", config.WebsocketPort)
+	port := fmt.Sprintf(":%d", *portInt)
+	fmt.Printf("Websocket running at port %v\n", port)
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal(err)
 	}
@@ -195,6 +201,44 @@ func sendMessage(channel string, message WebSocketMessage) {
 	}
 }
 
+func relayEvents(WebsocketEventsProvider string) {
+	log.Printf("connecting to %s", WebsocketEventsProvider)
+
+	c, _, err := websocket.DefaultDialer.Dial(WebsocketEventsProvider, nil)
+	if err != nil {
+		log.Fatal("dial:", err)
+	}
+	defer c.Close()
+
+	done := make(chan struct{})
+
+	defer close(done)
+	for {
+		_, message, err := c.ReadMessage()
+		if err != nil {
+			log.Println("read:", err)
+			return
+		}
+
+		var decodedMessage map[string]interface{}
+		if err := json.Unmarshal(message, &decodedMessage); err != nil {
+			panic(err)
+		}
+
+		data := &EventData{
+			Contract: decodedMessage["contract"].(string),
+			Call:     decodedMessage["data"],
+		}
+
+		m := WebSocketMessage{
+			Type: "events",
+			TXID: decodedMessage["txid"].(string),
+			Data: data,
+		}
+		sendMessage("events", m)
+	}
+}
+
 func getBestNode(list []string) *neoutils.SeedNodeResponse {
 	commaSeparated := strings.Join(list, ",")
 	return neoutils.SelectBestSeedNode(commaSeparated)
@@ -245,6 +289,9 @@ func (h *NEOConnectionHandler) OnReceive(tx neotx.TX) {
 		//Call getrawtransaction to get the transaction detail by txid
 
 		best := getBestNode(h.config.RPCSeedList)
+		if best == nil {
+			return
+		}
 
 		client := neorpc.NewClient(best.URL)
 		raw := client.GetRawTransaction(tx.ID)
@@ -291,10 +338,12 @@ func (h *NEOConnectionHandler) OnError(e error) {
 		connectedToNEONode = false
 		fmt.Printf("Disconnected from host. will try to connect in 15 seconds...")
 		for {
-			time.Sleep(15 * time.Second)
+			time.Sleep(2 * time.Second)
 			//we need to implement backoff and retry to reconnect here
 			//if the error is EOF then we try to reconnect
 			go startConnectToSeed(currentConfig)
 		}
+	} else {
+		os.Exit(1);
 	}
 }
